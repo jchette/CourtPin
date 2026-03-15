@@ -205,7 +205,7 @@ async function sendAccessEmail({ to, memberName, pin, startDate, endDate, courts
 
   const resp = await axios.post(
     'https://api.resend.com/emails',
-    { from: config.email.from, to: [to], subject: `${b.clubName} Access PIN - ${startStr}`, html },
+    { from: config.email.from, to: [to], subject: `Court Access PIN - ${startStr}`, html },
     { headers: { Authorization: `Bearer ${config.email.resendApiKey}`, 'Content-Type': 'application/json' }, timeout: 10_000 }
   );
 
