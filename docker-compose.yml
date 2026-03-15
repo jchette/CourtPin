@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  courtpass:
+    build: .
+    container_name: courtpass
+    restart: unless-stopped
+
+    # Load all environment variables from your .env file
+    # Copy env.example to .env and fill in your values before running
+    env_file: .env
+
+    ports:
+      # Admin portal is accessible at http://YOUR_HOST_IP:3000/admin
+      # Change the left number to use a different external port
+      # e.g. "8080:3000" makes it accessible at port 8080
+      - "3000:3000"
+
+    volumes:
+      # Persists state.json across container restarts
+      # This prevents duplicate PIN emails if the container is restarted
+      - courtpass_data:/data
+
+    # Optional: limit resource usage on a shared machine
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 256M
+    #       cpus: '0.5'
+
+volumes:
+  courtpass_data:
+    driver: local

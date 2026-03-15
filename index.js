@@ -20,7 +20,8 @@
 'use strict';
 
 require('dotenv').config();
-const axios = require('axios');
+const axios      = require('axios');
+const nodemailer = require('nodemailer');
 const https = require('https');
 const http  = require('http');
 const cron  = require('node-cron');
@@ -41,8 +42,18 @@ const config = {
     resources: parseResources(process.env.UNIFI_RESOURCES),
   },
   email: {
-    resendApiKey: process.env.RESEND_API_KEY,
-    from:         process.env.EMAIL_FROM || '',
+    // Transport mode:
+    //   If RESEND_API_KEY is set → use Resend (recommended for Railway / cloud)
+    //   Otherwise              → use SMTP nodemailer (recommended for local/self-hosted)
+    resendApiKey: process.env.RESEND_API_KEY || '',
+    from:         process.env.EMAIL_FROM     || '',
+    smtp: {
+      host:   process.env.SMTP_HOST   || '',
+      port:   parseInt(process.env.SMTP_PORT || '587', 10),
+      secure: process.env.SMTP_SECURE === 'true', // true for port 465, false for 587/STARTTLS
+      user:   process.env.SMTP_USER   || '',
+      pass:   process.env.SMTP_PASS   || '',
+    },
   },
   twilio: {
     enabled:    process.env.TWILIO_ENABLED === 'true',
@@ -203,16 +214,38 @@ async function sendAccessEmail({ to, memberName, pin, startDate, endDate, courts
 </body>
 </html>`;
 
-  const resp = await axios.post(
-    'https://api.resend.com/emails',
-    { from: config.email.from, to: [to], subject: `Court Access PIN - ${startStr}`, html },
-    { headers: { Authorization: `Bearer ${config.email.resendApiKey}`, 'Content-Type': 'application/json' }, timeout: 10_000 }
-  );
+  const subject = `${b.clubName} Access PIN - ${startStr}`;
 
-  if (resp.data?.id) {
-    log('info', 'Email sent', { to, id: resp.data.id });
+  if (config.email.resendApiKey) {
+    // ── Resend (recommended for cloud hosting like Railway) ──────────────────
+    const resp = await axios.post(
+      'https://api.resend.com/emails',
+      { from: config.email.from, to: [to], subject, html },
+      { headers: { Authorization: `Bearer ${config.email.resendApiKey}`, 'Content-Type': 'application/json' }, timeout: 10_000 }
+    );
+    if (resp.data?.id) {
+      log('info', 'Email sent via Resend', { to, id: resp.data.id });
+    } else {
+      throw new Error(`Resend unexpected response: ${JSON.stringify(resp.data)}`);
+    }
   } else {
-    throw new Error(`Resend unexpected response: ${JSON.stringify(resp.data)}`);
+    // ── SMTP via nodemailer (recommended for local / self-hosted setups) ─────
+    const transporter = nodemailer.createTransport({
+      host:   config.email.smtp.host,
+      port:   config.email.smtp.port,
+      secure: config.email.smtp.secure,
+      auth: {
+        user: config.email.smtp.user,
+        pass: config.email.smtp.pass,
+      },
+    });
+    await transporter.sendMail({
+      from:    config.email.from,
+      to,
+      subject,
+      html,
+    });
+    log('info', 'Email sent via SMTP', { to, host: config.email.smtp.host });
   }
 }
 
@@ -865,13 +898,22 @@ function validateConfig() {
     ['CR_API_KEY',      config.courtreserve.apiKey],
     ['UNIFI_HOST',      config.unifi.host],
     ['UNIFI_API_TOKEN', config.unifi.token],
-    ['RESEND_API_KEY',  config.email.resendApiKey],
     ['EMAIL_FROM',      config.email.from],
     ['ADMIN_SECRET',    config.adminSecret],
   ];
   const missing = required.filter(([, v]) => !v).map(([k]) => k);
   if (missing.length) {
     console.error(`❌  Missing required environment variables: ${missing.join(', ')}`);
+    process.exit(1);
+  }
+
+  // Email transport validation
+  if (config.email.resendApiKey) {
+    log('info', '📧 Email transport: Resend');
+  } else if (config.email.smtp.host && config.email.smtp.user) {
+    log('info', '📧 Email transport: SMTP', { host: config.email.smtp.host, port: config.email.smtp.port });
+  } else {
+    console.error('❌  No email transport configured. Set either RESEND_API_KEY (for Resend) or SMTP_HOST + SMTP_USER + SMTP_PASS (for SMTP).');
     process.exit(1);
   }
   if (!config.unifi.resources.length) {
@@ -886,6 +928,7 @@ async function main() {
     notifyMinutesBefore:  config.notifyMinutesBefore,
     accessBufferMinutes:  config.accessBufferMinutes,
     cleanupBufferMinutes: config.cleanupBufferMinutes,
+    emailTransport:       config.email.resendApiKey ? 'resend' : 'smtp',
     smsEnabled:           config.twilio.enabled,
     resources:            config.unifi.resources,
   });
