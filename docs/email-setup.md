@@ -180,18 +180,20 @@ Your Club Name Access PIN - Mon Mar 16, 12:00 PM
 If Twilio is enabled, members also receive:
 
 ```
-Your Club Name — Building Access PIN
+Your Club Name — Your Door Access PIN
 
-Hi Joel,
 PIN: 67203419
-Active from: Mon Mar 16, 11:30 AM
-Court: Total Athlete Court #1
-Start: Mon Mar 16, 12:00 PM
+Court: Court 1
+Reservation: Mar 15, 12:00 PM
 
-Do not share this PIN. Reply STOP to opt out.
+Enter this PIN at the front door keypad. Your PIN is active 30 minutes before your reservation starts and expires when your reservation ends.
+
+Do not share this PIN.
 ```
 
-Phone numbers from CourtReserve are automatically formatted to E.164 (`304-830-0626` → `+13048300626`).
+> The SMS is written to stand completely on its own — a member who did not read their email should still understand exactly what to do when they arrive at the door. The club name is pulled dynamically from `BRAND_CLUB_NAME`.
+
+Phone numbers from CourtReserve are automatically formatted to E.164 (`3045550100` → `+13045550100`).
 
 ---
 

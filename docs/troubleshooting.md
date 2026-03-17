@@ -239,6 +239,27 @@ Failed to send email {"err":"535 Authentication failed"}
 
 ---
 
+### PIN rejected when using static mode
+
+**Symptom:** `Failed to assign PIN` error in logs when `PIN_MODE=static` is set.
+
+**Cause:** UniFi Access is configured for a fixed PIN length (4, 6, or 8 digits) but the CourtReserve `OrganizationMemberId` is 7 digits and does not match.
+
+**Fix:** In UniFi Access go to **Settings → General → PIN** and change from Fixed Length to **Variable Length**, then save. CourtPin will retry on the next cycle.
+
+---
+
+### Static mode PIN not working at the door
+
+**Symptom:** Member enters their member ID at the keypad but access is denied.
+
+**Possible causes:**
+1. UniFi PIN mode is still set to Fixed Length — change to Variable Length as above
+2. Member is entering the wrong number — confirm their `OrganizationMemberId` in CourtReserve Admin → Members
+3. `PIN_MODE` variable is still set to `random` in Railway — confirm it is set to `static`
+
+---
+
 ### PIN shows as "not stored" in admin portal
 
 **Symptom:** A reservation card shows "PIN not stored for this record."
