@@ -254,16 +254,28 @@ async function sendAccessEmail({ to, memberName, pin, startDate, endDate, courts
 async function sendAccessSms({ to, memberName, pin, startDate, courts, accessBufferMinutes }) {
   const b           = config.brand;
   const accessStart = new Date(startDate.getTime() - accessBufferMinutes * 60_000);
+
+  // Keep SMS under 160 characters to avoid splitting into 2 segments (doubles cost).
+  // Uses a compact date format (Mar 15, 12:00 PM) instead of the full email format.
+  const fmtShort = dt => new Date(dt).toLocaleString('en-US', {
+    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  });
+
+  const courtStr = courts || 'Reserved Court';
+
+  // SMS is designed to stand alone — a member who did not read their email
+  // should still understand exactly what to do when they arrive at the door.
   const body = [
-    `${b.clubName} — Building Access PIN`,
-    '',
-    `Hi ${memberName},`,
+    `${b.clubName}`,
+    `Your Door Access PIN`,
+    ``,
     `PIN: ${pin}`,
-    `Active from: ${fmtDate(accessStart)}`,
-    `Court: ${courts || 'Reserved Court'}`,
-    `Start: ${fmtDate(startDate)}`,
-    '',
-    `Do not share this PIN. Reply STOP to opt out.`,
+    `Court: ${courtStr}`,
+    `Reservation: ${fmtShort(startDate)}`,
+    ``,
+    `Enter this PIN at the front door keypad. Your PIN is active ${accessBufferMinutes} minutes before your reservation and is valid for this reservation only.`,
+    ``,
+    `Do not share this PIN.`,
   ].join('\n');
 
   const cleaned = to.replace(/\D/g, '');
