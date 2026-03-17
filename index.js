@@ -415,16 +415,17 @@ async function processReservation(reservation, state) {
   const startEpoch       = toEpoch(startDate) - accessBufferSecs;
   const endEpoch         = toEpoch(endDate);
 
-  log('debug', 'Reservation players found', {
-    reservationId,
-    playerCount: players.length,
-    players: players.map(p => ({
-      memberId: p.OrganizationMemberId,
-      name:     `${p.FirstName || ''} ${p.LastName || ''}`.trim(),
-      hasEmail: !!p.Email,
-      hasPhone: !!p.Phone,
-    })),
-  });
+  // Uncomment to debug player data returned from CourtReserve:
+  // log('debug', 'Reservation players found', {
+  //   reservationId,
+  //   playerCount: players.length,
+  //   players: players.map(p => ({
+  //     memberId: p.OrganizationMemberId,
+  //     name:     `${p.FirstName || ''} ${p.LastName || ''}`.trim(),
+  //     hasEmail: !!p.Email,
+  //     hasPhone: !!p.Phone,
+  //   })),
+  // });
 
   for (const player of players) {
     const { OrganizationMemberId: memberId, FirstName, LastName, Email: email, Phone: phone } = player;
