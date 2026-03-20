@@ -249,7 +249,7 @@ async function sendUnlockNotificationSms({ to, memberName, eventName, startDate,
   else { throw new Error(`Twilio unexpected response: ${JSON.stringify(resp.data)}`); }
 }
 
-async function sendAccessEmail({ to, memberName, pin, startDate, endDate, courts, accessBufferMinutes }) {
+async function sendAccessEmail({ to, memberName, pin, startDate, endDate, courts, accessBufferMinutes, courtLabel = 'Court' }) {
   const b           = config.brand;
   const startStr    = fmtDate(startDate);
   const endStr      = fmtDate(endDate);
@@ -306,7 +306,7 @@ async function sendAccessEmail({ to, memberName, pin, startDate, endDate, courts
         <div class="active">Active from ${accessStr}</div>
       </div>
       <div class="details">
-        <p>🎾 <strong>Court:</strong> ${courtStr}</p>
+        <p>🎾 <strong>${courtLabel}:</strong> ${courtStr}</p>
         <p>🕐 <strong>Start:</strong> ${startStr}</p>
         <p>🕑 <strong>End:</strong>   ${endStr}</p>
       </div>
@@ -729,7 +729,7 @@ async function processEvents(registrations, state) {
           continue;
         }
 
-        try { await sendAccessEmail({ to: email, memberName, pin, startDate, endDate, courts: eventName, accessBufferMinutes: bufferMins }); }
+        try { await sendAccessEmail({ to: email, memberName, pin, startDate, endDate, courts: eventName, accessBufferMinutes: bufferMins, courtLabel: 'Event' }); }
         catch (err) { log('error', 'Failed to send event email', { email, err: err.message }); }
 
         if (config.twilio.enabled && phone) {
@@ -768,7 +768,7 @@ async function processEvents(registrations, state) {
         for (const reg of regs) {
           if (!reg.Email) continue;
           const memberName = `${reg.FirstName || ''} ${reg.LastName || ''}`.trim() || 'Member';
-          try { await sendAccessEmail({ to: reg.Email, memberName, pin, startDate, endDate, courts: eventName, accessBufferMinutes: bufferMins }); }
+          try { await sendAccessEmail({ to: reg.Email, memberName, pin, startDate, endDate, courts: eventName, accessBufferMinutes: bufferMins, courtLabel: 'Event' }); }
           catch (err) { log('error', 'Failed to send shared event email', { email: reg.Email, err: err.message }); }
           if (config.twilio.enabled && reg.Phone) {
             try { await sendAccessSms({ to: reg.Phone, memberName, pin, startDate, courts: eventName, accessBufferMinutes: bufferMins }); }
