@@ -802,31 +802,49 @@ async function processEvents(registrations, state) {
     }
 
     // ── unlock: unlock doors for the event duration ───────────────────────
+    // The door unlock happens once. If EVENT_UNLOCK_NOTIFY=true, per-registrant
+    // notifications are tracked separately so new registrants always get notified
+    // even after the initial unlock has already fired.
     else if (mode === 'unlock') {
       const unlockKey = `evt:${eventKey}:unlock`;
+
+      // Step 1 — unlock doors once
       if (!state.processed[unlockKey]) {
         const durationSecs = (endEpoch - startEpoch); // includes buffer
         for (const resource of config.unifi.resources) {
           await unlockDoor(resource.id, resource.type, durationSecs);
         }
-
-        state.processed[unlockKey] = { court: eventName, startEpoch: toEpoch(startDate), endEpoch, processedAt: Math.floor(nowMs / 1000), type: 'event_unlock' };
+        state.processed[unlockKey] = { court: eventName, startEpoch: toEpoch(startDate), endEpoch, processedAt: Math.floor(nowMs / 1000), type: 'event_unlock', notified: [] };
         saveState(state);
         log('info', '✅ Doors unlocked for event', { unlockKey, durationSecs });
+      }
 
-        // Optional notification to all registrants
-        if (config.events.unlockNotify) {
-          for (const reg of regs) {
-            if (!reg.Email) continue;
-            const memberName = `${reg.FirstName || ''} ${reg.LastName || ''}`.trim() || 'Member';
-            try { await sendUnlockNotificationEmail({ to: reg.Email, memberName, eventName, startDate, endDate, accessBufferMinutes: bufferMins }); }
-            catch (err) { log('error', 'Failed to send unlock notification email', { email: reg.Email, err: err.message }); }
-            if (config.twilio.enabled && reg.Phone) {
-              try { await sendUnlockNotificationSms({ to: reg.Phone, memberName, eventName, startDate, accessBufferMinutes: bufferMins }); }
-              catch (err) { log('error', 'Failed to send unlock notification SMS', { phone: reg.Phone, err: err.message }); }
-            }
+      // Step 2 — notify registrants who haven't been notified yet
+      // Runs every cycle so new registrants always get the notification
+      if (config.events.unlockNotify) {
+        const unlockEntry = state.processed[unlockKey];
+        const notified    = new Set(unlockEntry.notified || []);
+
+        for (const reg of regs) {
+          if (!reg.Email) continue;
+          if (notified.has(String(reg.OrganizationMemberId))) continue;
+
+          const memberName = `${reg.FirstName || ''} ${reg.LastName || ''}`.trim() || 'Member';
+          try { await sendUnlockNotificationEmail({ to: reg.Email, memberName, eventName, startDate, endDate, accessBufferMinutes: bufferMins }); }
+          catch (err) { log('error', 'Failed to send unlock notification email', { email: reg.Email, err: err.message }); continue; }
+
+          if (config.twilio.enabled && reg.Phone) {
+            try { await sendUnlockNotificationSms({ to: reg.Phone, memberName, eventName, startDate, accessBufferMinutes: bufferMins }); }
+            catch (err) { log('error', 'Failed to send unlock notification SMS', { phone: reg.Phone, err: err.message }); }
           }
+
+          notified.add(String(reg.OrganizationMemberId));
+          log('info', '✅ Unlock notification sent to registrant', { unlockKey, email: reg.Email });
         }
+
+        // Persist updated notified list
+        unlockEntry.notified = [...notified];
+        saveState(state);
       }
     }
   }
