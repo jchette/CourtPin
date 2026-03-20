@@ -679,7 +679,7 @@ async function processEvents(registrations, state) {
   // Group registrations by eventId:eventDateId so we handle each event session once
   const eventMap = new Map();
   for (const reg of registrations) {
-    const eventKey = `${reg.EventId}:${reg.EventDateId}`;
+    const eventKey = `${reg.EventId}:${reg.EventDateId || 0}`;
     if (!eventMap.has(eventKey)) eventMap.set(eventKey, []);
     eventMap.get(eventKey).push(reg);
   }
@@ -693,10 +693,13 @@ async function processEvents(registrations, state) {
     const minutesUntilStart = (startDate.getTime() - nowMs) / 60_000;
     const bufferMins = config.events.accessBufferMinutes;
 
-    if (minutesUntilStart > config.notifyMinutesBefore || minutesUntilStart < -5) continue;
+    // For events, allow processing until the event ends (not just 5 min after start).
+    // This ensures late registrants who sign up after an event begins still get access.
+    const endEpoch   = toEpoch(endDate);
+    const minutesUntilEnd = (endDate.getTime() - nowMs) / 60_000;
+    if (minutesUntilStart > config.notifyMinutesBefore || minutesUntilEnd < 0) continue;
 
     const startEpoch = toEpoch(startDate) - (bufferMins * 60);
-    const endEpoch   = toEpoch(endDate);
     const mode       = config.events.accessMode;
 
     log('info', `Processing event [${mode}]`, { eventKey, eventName, registrantCount: regs.length, minutesUntilStart: Math.round(minutesUntilStart) });
@@ -704,7 +707,7 @@ async function processEvents(registrations, state) {
     // ── pin_individual: one visitor + PIN per registrant ──────────────────
     if (mode === 'pin_individual') {
       for (const reg of regs) {
-        const stateKey   = `evt:${eventKey}:${reg.OrganizationMemberId}`;
+        const stateKey   = `evt:${reg.EventId}:${reg.EventDateId || 0}:${reg.OrganizationMemberId}`;
         if (state.processed[stateKey]) continue;
 
         const memberId   = reg.OrganizationMemberId;
@@ -744,8 +747,13 @@ async function processEvents(registrations, state) {
     }
 
     // ── pin_shared: one visitor + PIN for the whole event ─────────────────
+    // The visitor and PIN are created once. Per-registrant notifications are
+    // tracked separately so new registrants always receive the PIN even after
+    // the initial shared visitor has already been created.
     else if (mode === 'pin_shared') {
       const sharedKey = `evt:${eventKey}:shared`;
+
+      // Step 1 — create the shared visitor and PIN if not yet done
       if (!state.processed[sharedKey]) {
         let visitor;
         try {
@@ -760,22 +768,37 @@ async function processEvents(registrations, state) {
           continue;
         }
 
-        state.processed[sharedKey] = { visitorId: visitor.id, pin, court: eventName, startEpoch: toEpoch(startDate), endEpoch, processedAt: Math.floor(nowMs / 1000), type: 'event_shared' };
+        state.processed[sharedKey] = { visitorId: visitor.id, pin, court: eventName, startEpoch: toEpoch(startDate), endEpoch, processedAt: Math.floor(nowMs / 1000), type: 'event_shared', notified: [] };
         saveState(state);
         log('info', '✅ Shared event visitor created', { sharedKey, pin });
-
-        // Send the shared PIN to all registrants
-        for (const reg of regs) {
-          if (!reg.Email) continue;
-          const memberName = `${reg.FirstName || ''} ${reg.LastName || ''}`.trim() || 'Member';
-          try { await sendAccessEmail({ to: reg.Email, memberName, pin, startDate, endDate, courts: eventName, accessBufferMinutes: bufferMins, courtLabel: 'Event' }); }
-          catch (err) { log('error', 'Failed to send shared event email', { email: reg.Email, err: err.message }); }
-          if (config.twilio.enabled && reg.Phone) {
-            try { await sendAccessSms({ to: reg.Phone, memberName, pin, startDate, courts: eventName, accessBufferMinutes: bufferMins }); }
-            catch (err) { log('error', 'Failed to send shared event SMS', { phone: reg.Phone, err: err.message }); }
-          }
-        }
       }
+
+      // Step 2 — notify every registrant who hasn't been notified yet
+      // Runs every cycle so new registrants always get the PIN
+      const sharedEntry = state.processed[sharedKey];
+      const notified    = new Set(sharedEntry.notified || []);
+      const pin         = sharedEntry.pin;
+
+      for (const reg of regs) {
+        if (!reg.Email) continue;
+        if (notified.has(String(reg.OrganizationMemberId))) continue;
+
+        const memberName = `${reg.FirstName || ''} ${reg.LastName || ''}`.trim() || 'Member';
+        try { await sendAccessEmail({ to: reg.Email, memberName, pin, startDate, endDate, courts: eventName, accessBufferMinutes: bufferMins, courtLabel: 'Event' }); }
+        catch (err) { log('error', 'Failed to send shared event email', { email: reg.Email, err: err.message }); continue; }
+
+        if (config.twilio.enabled && reg.Phone) {
+          try { await sendAccessSms({ to: reg.Phone, memberName, pin, startDate, courts: eventName, accessBufferMinutes: bufferMins }); }
+          catch (err) { log('error', 'Failed to send shared event SMS', { phone: reg.Phone, err: err.message }); }
+        }
+
+        notified.add(String(reg.OrganizationMemberId));
+        log('info', '✅ Shared PIN sent to registrant', { sharedKey, email: reg.Email, pin });
+      }
+
+      // Persist updated notified list
+      sharedEntry.notified = [...notified];
+      saveState(state);
     }
 
     // ── unlock: unlock doors for the event duration ───────────────────────
@@ -1004,20 +1027,28 @@ function startAdminServer() {
       const active = Object.entries(state.processed)
         .filter(([, v]) => v.endEpoch > nowSec)
         .sort(([, a], [, b]) => a.startEpoch - b.startEpoch)
-        .map(([key, v]) => ({
-          key,
-          reservationId: key.split(':')[1] || key.split(':')[0],
-          playerId:      key.split(':')[2] || key.split(':')[1],
-          email:         v.email      || '',
-          pin:           v.pin        || null,
-          memberName:    v.memberName || '',
-          phone:         v.phone      || '',
-          court:         v.court      || '',
-          startsAt:      v.startEpoch ? new Date(v.startEpoch * 1000).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : '',
-          endsAt:        new Date(v.endEpoch * 1000).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
-          date:          new Date(v.endEpoch * 1000).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
-          type:          v.type || 'reservation',  // reservation | event | event_shared | event_unlock
-        }));
+        .map(([key, v]) => {
+          const parts       = key.split(':');
+          const isEvent     = parts[0] === 'evt';
+          // reservation key: "reservationId:memberId"
+          // event key:       "evt:eventId:eventDateId:memberId"  or  "evt:eventId:eventDateId:shared"
+          const reservationId = isEvent ? parts.slice(1, 3).join(':') : parts[0];
+          const playerId      = isEvent ? (parts[3] || parts[2]) : parts[1];
+          return {
+            key,
+            reservationId,
+            playerId,
+            email:      v.email      || '',
+            pin:        v.pin        || null,
+            memberName: v.memberName || (v.type === 'event_unlock' ? v.court : ''),
+            phone:      v.phone      || '',
+            court:      v.court      || '',
+            startsAt:   v.startEpoch ? new Date(v.startEpoch * 1000).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : '',
+            endsAt:     new Date(v.endEpoch * 1000).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
+            date:       new Date(v.endEpoch * 1000).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+            type:       v.type || 'reservation',
+          };
+        });
       return send(200, dashboardPage(active));
     }
 
@@ -1108,7 +1139,7 @@ function dashboardPage(active) {
           <span class="detail-value"><a href="tel:${r.phone}" class="phone-link">${r.phone}</a></span>
         </div>` : ''}
         <div class="detail-item">
-          <span class="detail-label">Court</span>
+          <span class="detail-label">${r.type && r.type !== 'reservation' ? 'Event' : 'Court'}</span>
           <span class="detail-value">${r.court || '—'}</span>
         </div>
         <div class="detail-item">
