@@ -2,19 +2,22 @@
  * CourtReserve <-> UniFi Access Integration
  *
  * Flow:
- *  1. Poll CourtReserve every minute for today's active reservations.
+ *  1. Poll CourtReserve every minute for today's active reservations and events.
  *  2. For each reservation within the notification window (not yet processed):
- *     a. Create a Visitor in UniFi Access with a time window that starts
- *        ACCESS_BUFFER_MINUTES before the reservation.
- *     b. Generate a random PIN via the UniFi Credential API.
+ *     a. Create a Visitor in UniFi Access scoped to the reservation window.
+ *     b. Generate or derive a PIN (random or static member ID).
  *     c. Assign the PIN to the Visitor.
- *     d. Email the member their PIN via Resend.
+ *     d. Email the member their PIN via Resend or SMTP.
  *     e. Optionally SMS the member via Twilio.
- *  3. After the reservation ends + cleanup buffer, delete the Visitor.
- *  4. Serve a mobile-friendly admin portal for PIN lookup and resend.
+ *  3. For each event registration within the notification window:
+ *     - pin_individual: each registrant gets their own Visitor + PIN
+ *     - pin_shared:     one Visitor + PIN shared across all registrants
+ *     - unlock:         door(s) unlocked for the event duration, optional notification
+ *  4. After reservations/events end + cleanup buffer, delete Visitors.
+ *  5. Serve a mobile-friendly admin portal for PIN lookup and resend.
  *
- * Required CourtReserve API role : ReservationReport (Read)
- * Required UniFi Access scopes   : view:credential, edit:visitor
+ * Required CourtReserve API roles : ReservationReport (Read), EventRegistrationReport (Read)
+ * Required UniFi Access scopes    : view:credential, edit:visitor
  */
 
 'use strict';
@@ -79,6 +82,16 @@ const config = {
   pinMode:     process.env.PIN_MODE === 'static' ? 'static' : 'random',
   // static — uses CourtReserve OrganizationMemberId as PIN (consistent, member learns once)
   // random  — generates a new random PIN each reservation (default)
+  events: {
+    // How door access is granted to event registrants:
+    //   pin_individual — each registrant gets their own unique PIN (default)
+    //   pin_shared     — one PIN generated for the event, sent to all registrants
+    //   unlock         — door(s) unlocked for the event duration, no PINs
+    accessMode:          process.env.EVENT_ACCESS_MODE || 'pin_individual',
+    accessBufferMinutes: parseInt(process.env.EVENT_ACCESS_BUFFER_MINUTES || '30', 10),
+    // unlock mode only: send an email/SMS notification that the facility is open
+    unlockNotify:        process.env.EVENT_UNLOCK_NOTIFY === 'true',
+  },
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -140,6 +153,101 @@ const unifi = axios.create({
 });
 
 // ─── Email ────────────────────────────────────────────────────────────────────
+
+async function sendUnlockNotificationEmail({ to, memberName, eventName, startDate, endDate, accessBufferMinutes }) {
+  const b           = config.brand;
+  const startStr    = fmtDate(startDate);
+  const endStr      = fmtDate(endDate);
+  const accessStart = new Date(startDate.getTime() - accessBufferMinutes * 60_000);
+  const accessStr   = fmtDate(accessStart);
+
+  const contactLines = [
+    b.phone   ? `📞 ${b.phone}`   : '',
+    b.website ? `🌐 ${b.website}` : '',
+    b.address ? `📍 ${b.address}` : '',
+  ].filter(Boolean).join('&nbsp;&nbsp;·&nbsp;&nbsp;');
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 0; }
+    .container { max-width: 600px; margin: 40px auto; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,.1); }
+    .header { background: ${b.headerColor}; color: #fff; padding: 28px 32px; text-align: center; }
+    .header h1 { margin: 0; font-size: 24px; font-weight: 700; }
+    .header .tagline { margin: 6px 0 0; font-size: 13px; opacity: .85; }
+    .body { padding: 32px; color: #333; }
+    .info-box { background: #f0fff8; border: 2px solid ${b.accentColor}; border-radius: 10px; text-align: center; margin: 24px 0; padding: 24px; }
+    .info-box .headline { font-size: 22px; font-weight: bold; color: ${b.accentColor}; }
+    .info-box .sub { font-size: 13px; color: #555; margin-top: 8px; }
+    .details { background: #f9f9f9; border-radius: 8px; padding: 16px; margin-top: 16px; border-left: 4px solid ${b.accentColor}; }
+    .details p { margin: 6px 0; font-size: 14px; }
+    .footer { text-align: center; font-size: 12px; color: #aaa; padding: 20px 16px; border-top: 1px solid #f0f0f0; line-height: 1.8; }
+    .footer strong { color: #888; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>${b.clubName}</h1>
+      ${b.tagline ? `<p class="tagline">${b.tagline}</p>` : ''}
+    </div>
+    <div class="body">
+      <p style="font-size:16px;">Hi <strong>${memberName}</strong>,</p>
+      <p style="margin-top:8px; color:#555;">Your upcoming event is almost here! The facility will be unlocked and ready for you.</p>
+      <div class="info-box">
+        <div class="headline">Facility Open</div>
+        <div class="sub">No PIN required — doors will be unlocked for your event</div>
+        <div class="sub" style="color:${b.accentColor}; font-weight:600; margin-top:6px;">Open from ${accessStr}</div>
+      </div>
+      <div class="details">
+        <p>📅 <strong>Event:</strong> ${eventName}</p>
+        <p>🕐 <strong>Start:</strong> ${startStr}</p>
+        <p>🕑 <strong>End:</strong>   ${endStr}</p>
+      </div>
+    </div>
+    <div class="footer">
+      <strong>${b.clubName}</strong><br/>
+      ${contactLines ? `${contactLines}<br/>` : ''}
+      This is an automated message — please do not reply to this email.
+    </div>
+  </div>
+</body>
+</html>`;
+
+  const subject = `${b.clubName} Access PIN - ${fmtDate(startDate)}`;
+  await _sendEmail(to, subject, html);
+  log('info', 'Unlock notification email sent', { to });
+}
+
+async function sendUnlockNotificationSms({ to, memberName, eventName, startDate, accessBufferMinutes }) {
+  const b           = config.brand;
+  const accessStart = new Date(startDate.getTime() - accessBufferMinutes * 60_000);
+  const fmtShort    = dt => new Date(dt).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+
+  const body = [
+    `${b.clubName}`,
+    `Facility Access`,
+    ``,
+    `Hi ${memberName},`,
+    `Event: ${eventName}`,
+    `Doors open: ${fmtShort(accessStart)}`,
+    ``,
+    `No PIN needed — the facility will be unlocked for your event.`,
+  ].join('\n');
+
+  const cleaned = to.replace(/\D/g, '');
+  const e164    = cleaned.startsWith('1') ? `+${cleaned}` : `+1${cleaned}`;
+
+  const resp = await axios.post(
+    `https://api.twilio.com/2010-04-01/Accounts/${config.twilio.accountSid}/Messages.json`,
+    new URLSearchParams({ From: config.twilio.fromNumber, To: e164, Body: body }).toString(),
+    { auth: { username: config.twilio.accountSid, password: config.twilio.authToken }, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10_000 }
+  );
+  if (resp.data?.sid) { log('info', 'Unlock notification SMS sent', { to: e164, sid: resp.data.sid }); }
+  else { throw new Error(`Twilio unexpected response: ${JSON.stringify(resp.data)}`); }
+}
 
 async function sendAccessEmail({ to, memberName, pin, startDate, endDate, courts, accessBufferMinutes }) {
   const b           = config.brand;
@@ -218,37 +326,29 @@ async function sendAccessEmail({ to, memberName, pin, startDate, endDate, courts
 </html>`;
 
   const subject = `${b.clubName} Access PIN - ${startStr}`;
+  await _sendEmail(to, subject, html);
+  log('info', 'Access email sent', { to });
+}
 
+// ── Shared email transport helper ─────────────────────────────────────────────
+async function _sendEmail(to, subject, html) {
   if (config.email.resendApiKey) {
-    // ── Resend (recommended for cloud hosting like Railway) ──────────────────
+    // Resend — recommended for cloud hosting (Railway), sends over HTTPS port 443
     const resp = await axios.post(
       'https://api.resend.com/emails',
       { from: config.email.from, to: [to], subject, html },
       { headers: { Authorization: `Bearer ${config.email.resendApiKey}`, 'Content-Type': 'application/json' }, timeout: 10_000 }
     );
-    if (resp.data?.id) {
-      log('info', 'Email sent via Resend', { to, id: resp.data.id });
-    } else {
-      throw new Error(`Resend unexpected response: ${JSON.stringify(resp.data)}`);
-    }
+    if (!resp.data?.id) throw new Error(`Resend unexpected response: ${JSON.stringify(resp.data)}`);
   } else {
-    // ── SMTP via nodemailer (recommended for local / self-hosted setups) ─────
+    // SMTP via nodemailer — recommended for local / self-hosted setups
     const transporter = nodemailer.createTransport({
       host:   config.email.smtp.host,
       port:   config.email.smtp.port,
       secure: config.email.smtp.secure,
-      auth: {
-        user: config.email.smtp.user,
-        pass: config.email.smtp.pass,
-      },
+      auth:   { user: config.email.smtp.user, pass: config.email.smtp.pass },
     });
-    await transporter.sendMail({
-      from:    config.email.from,
-      to,
-      subject,
-      html,
-    });
-    log('info', 'Email sent via SMTP', { to, host: config.email.smtp.host });
+    await transporter.sendMail({ from: config.email.from, to, subject, html });
   }
 }
 
@@ -334,6 +434,30 @@ async function fetchTodaysReservations() {
   return resp.data.Data || [];
 }
 
+async function fetchTodaysEventRegistrations() {
+  const now        = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0,  0,  0);
+  const endOfDay   = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
+
+  const resp = await courtreserve.get('/api/v1/eventregistrationreport/listactive', {
+    params: {
+      eventDateFrom: fmtLocalDatetime(startOfDay),
+      eventDateTo:   fmtLocalDatetime(endOfDay),
+    },
+  });
+
+  log('debug', 'CourtReserve event registrations response', {
+    isSuccess:   resp.data?.IsSuccessStatusCode,
+    recordCount: resp.data?.Data?.length ?? 0,
+  });
+
+  if (!resp.data?.IsSuccessStatusCode) {
+    throw new Error(`CourtReserve event API error: ${resp.data?.ErrorMessage || 'unknown'}`);
+  }
+
+  return resp.data.Data || [];
+}
+
 // ─── UniFi Access API ─────────────────────────────────────────────────────────
 
 async function generatePin() {
@@ -366,6 +490,32 @@ async function deleteVisitor(visitorId) {
   const resp = await unifi.delete(`/api/v1/developer/visitors/${visitorId}`, { params: { is_force: true } });
   if (resp.data?.code !== 'SUCCESS') {
     log('warn', 'Delete visitor non-success (may already be removed)', { visitorId, code: resp.data?.code });
+  }
+}
+
+async function unlockDoor(resourceId, resourceType, durationSeconds) {
+  // Unlocks a door or all doors in a door group for a set duration.
+  // UniFi automatically relocks to the door's normal schedule when the duration expires.
+  if (resourceType === 'door_group') {
+    // Fetch doors in the group and unlock each one
+    try {
+      const resp = await unifi.get('/api/v1/developer/door_groups/topology');
+      const group = (resp.data?.data || []).find(g => g.id === resourceId);
+      if (!group) { log('warn', 'Door group not found for unlock', { resourceId }); return; }
+      for (const door of (group.doors || [])) {
+        await unifi.put(`/api/v1/developer/doors/${door.id}/unlock`, { unlock_time_limit: durationSeconds });
+        log('info', 'Door unlocked', { doorId: door.id, doorName: door.name, durationSeconds });
+      }
+    } catch (err) {
+      log('error', 'Failed to unlock door group', { resourceId, err: err.message });
+    }
+  } else if (resourceType === 'door') {
+    try {
+      await unifi.put(`/api/v1/developer/doors/${resourceId}/unlock`, { unlock_time_limit: durationSeconds });
+      log('info', 'Door unlocked', { doorId: resourceId, durationSeconds });
+    } catch (err) {
+      log('error', 'Failed to unlock door', { resourceId, err: err.message });
+    }
   }
 }
 
@@ -525,6 +675,140 @@ async function processReservation(reservation, state) {
   }
 }
 
+async function processEvents(registrations, state) {
+  // Group registrations by eventId:eventDateId so we handle each event session once
+  const eventMap = new Map();
+  for (const reg of registrations) {
+    const eventKey = `${reg.EventId}:${reg.EventDateId}`;
+    if (!eventMap.has(eventKey)) eventMap.set(eventKey, []);
+    eventMap.get(eventKey).push(reg);
+  }
+
+  for (const [eventKey, regs] of eventMap) {
+    const first      = regs[0];
+    const startDate  = new Date(first.StartTime);
+    const endDate    = new Date(first.EndTime);
+    const eventName  = first.EventName || 'Event';
+    const nowMs      = Date.now();
+    const minutesUntilStart = (startDate.getTime() - nowMs) / 60_000;
+    const bufferMins = config.events.accessBufferMinutes;
+
+    if (minutesUntilStart > config.notifyMinutesBefore || minutesUntilStart < -5) continue;
+
+    const startEpoch = toEpoch(startDate) - (bufferMins * 60);
+    const endEpoch   = toEpoch(endDate);
+    const mode       = config.events.accessMode;
+
+    log('info', `Processing event [${mode}]`, { eventKey, eventName, registrantCount: regs.length, minutesUntilStart: Math.round(minutesUntilStart) });
+
+    // ── pin_individual: one visitor + PIN per registrant ──────────────────
+    if (mode === 'pin_individual') {
+      for (const reg of regs) {
+        const stateKey   = `evt:${eventKey}:${reg.OrganizationMemberId}`;
+        if (state.processed[stateKey]) continue;
+
+        const memberId   = reg.OrganizationMemberId;
+        const memberName = `${reg.FirstName || ''} ${reg.LastName || ''}`.trim() || 'Member';
+        const email      = reg.Email;
+        const phone      = reg.Phone || '';
+
+        if (!email) { log('warn', 'Event registrant has no email — skipping', { stateKey }); continue; }
+
+        let visitor;
+        try {
+          visitor = await createVisitor({ firstName: reg.FirstName || 'Guest', lastName: reg.LastName || '', email, phone, startTime: startEpoch, endTime: endEpoch });
+        } catch (err) { log('error', 'Failed to create visitor for event registrant', { stateKey, err: err.message }); continue; }
+
+        let pin;
+        try {
+          pin = config.pinMode === 'static' && memberId ? String(memberId) : await generatePin();
+          await assignPin(visitor.id, pin);
+        } catch (err) {
+          log('error', 'Failed to assign PIN for event registrant', { stateKey, err: err.message });
+          await deleteVisitor(visitor.id).catch(() => {});
+          continue;
+        }
+
+        try { await sendAccessEmail({ to: email, memberName, pin, startDate, endDate, courts: eventName, accessBufferMinutes: bufferMins }); }
+        catch (err) { log('error', 'Failed to send event email', { email, err: err.message }); }
+
+        if (config.twilio.enabled && phone) {
+          try { await sendAccessSms({ to: phone, memberName, pin, startDate, courts: eventName, accessBufferMinutes: bufferMins }); }
+          catch (err) { log('error', 'Failed to send event SMS', { phone, err: err.message }); }
+        }
+
+        state.processed[stateKey] = { visitorId: visitor.id, memberId, email, pin, memberName, phone, court: eventName, startEpoch: toEpoch(startDate), endEpoch, processedAt: Math.floor(nowMs / 1000), type: 'event' };
+        saveState(state);
+        log('info', '✅ Event registrant processed (individual)', { stateKey, email, pin });
+      }
+    }
+
+    // ── pin_shared: one visitor + PIN for the whole event ─────────────────
+    else if (mode === 'pin_shared') {
+      const sharedKey = `evt:${eventKey}:shared`;
+      if (!state.processed[sharedKey]) {
+        let visitor;
+        try {
+          visitor = await createVisitor({ firstName: eventName, lastName: '', email: '', phone: '', startTime: startEpoch, endTime: endEpoch });
+        } catch (err) { log('error', 'Failed to create shared visitor for event', { eventKey, err: err.message }); continue; }
+
+        let pin;
+        try { pin = await generatePin(); await assignPin(visitor.id, pin); }
+        catch (err) {
+          log('error', 'Failed to assign shared PIN', { eventKey, err: err.message });
+          await deleteVisitor(visitor.id).catch(() => {});
+          continue;
+        }
+
+        state.processed[sharedKey] = { visitorId: visitor.id, pin, court: eventName, startEpoch: toEpoch(startDate), endEpoch, processedAt: Math.floor(nowMs / 1000), type: 'event_shared' };
+        saveState(state);
+        log('info', '✅ Shared event visitor created', { sharedKey, pin });
+
+        // Send the shared PIN to all registrants
+        for (const reg of regs) {
+          if (!reg.Email) continue;
+          const memberName = `${reg.FirstName || ''} ${reg.LastName || ''}`.trim() || 'Member';
+          try { await sendAccessEmail({ to: reg.Email, memberName, pin, startDate, endDate, courts: eventName, accessBufferMinutes: bufferMins }); }
+          catch (err) { log('error', 'Failed to send shared event email', { email: reg.Email, err: err.message }); }
+          if (config.twilio.enabled && reg.Phone) {
+            try { await sendAccessSms({ to: reg.Phone, memberName, pin, startDate, courts: eventName, accessBufferMinutes: bufferMins }); }
+            catch (err) { log('error', 'Failed to send shared event SMS', { phone: reg.Phone, err: err.message }); }
+          }
+        }
+      }
+    }
+
+    // ── unlock: unlock doors for the event duration ───────────────────────
+    else if (mode === 'unlock') {
+      const unlockKey = `evt:${eventKey}:unlock`;
+      if (!state.processed[unlockKey]) {
+        const durationSecs = (endEpoch - startEpoch); // includes buffer
+        for (const resource of config.unifi.resources) {
+          await unlockDoor(resource.id, resource.type, durationSecs);
+        }
+
+        state.processed[unlockKey] = { court: eventName, startEpoch: toEpoch(startDate), endEpoch, processedAt: Math.floor(nowMs / 1000), type: 'event_unlock' };
+        saveState(state);
+        log('info', '✅ Doors unlocked for event', { unlockKey, durationSecs });
+
+        // Optional notification to all registrants
+        if (config.events.unlockNotify) {
+          for (const reg of regs) {
+            if (!reg.Email) continue;
+            const memberName = `${reg.FirstName || ''} ${reg.LastName || ''}`.trim() || 'Member';
+            try { await sendUnlockNotificationEmail({ to: reg.Email, memberName, eventName, startDate, endDate, accessBufferMinutes: bufferMins }); }
+            catch (err) { log('error', 'Failed to send unlock notification email', { email: reg.Email, err: err.message }); }
+            if (config.twilio.enabled && reg.Phone) {
+              try { await sendUnlockNotificationSms({ to: reg.Phone, memberName, eventName, startDate, accessBufferMinutes: bufferMins }); }
+              catch (err) { log('error', 'Failed to send unlock notification SMS', { phone: reg.Phone, err: err.message }); }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 async function cleanupExpiredVisitors(state) {
   const nowSec = Math.floor(Date.now() / 1000);
   const buffer = config.cleanupBufferMinutes * 60;
@@ -566,21 +850,35 @@ async function cleanupExpiredVisitors(state) {
 async function runCycle() {
   const state = loadState();
 
+  // ── Reservations ──────────────────────────────────────────────────────────
   let reservations = [];
   try {
     reservations = await fetchTodaysReservations();
     log('info', `Fetched ${reservations.length} reservation(s)`);
   } catch (err) {
     log('error', 'Failed to fetch reservations', { err: err.message });
-    return;
   }
-
   for (const reservation of reservations) {
     await processReservation(reservation, state).catch(err =>
       log('error', 'Unexpected error processing reservation', { id: reservation.Id, err: err.message })
     );
   }
 
+  // ── Events ────────────────────────────────────────────────────────────────
+  let registrations = [];
+  try {
+    registrations = await fetchTodaysEventRegistrations();
+    log('info', `Fetched ${registrations.length} event registration(s)`);
+  } catch (err) {
+    log('error', 'Failed to fetch event registrations', { err: err.message });
+  }
+  if (registrations.length) {
+    await processEvents(registrations, state).catch(err =>
+      log('error', 'Unexpected error processing events', { err: err.message })
+    );
+  }
+
+  // ── Cleanup ───────────────────────────────────────────────────────────────
   await cleanupExpiredVisitors(state).catch(err =>
     log('error', 'Error during cleanup', { err: err.message })
   );
@@ -708,9 +1006,9 @@ function startAdminServer() {
         .sort(([, a], [, b]) => a.startEpoch - b.startEpoch)
         .map(([key, v]) => ({
           key,
-          reservationId: key.split(':')[0],
-          playerId:      key.split(':')[1],
-          email:         v.email,
+          reservationId: key.split(':')[1] || key.split(':')[0],
+          playerId:      key.split(':')[2] || key.split(':')[1],
+          email:         v.email      || '',
           pin:           v.pin        || null,
           memberName:    v.memberName || '',
           phone:         v.phone      || '',
@@ -718,6 +1016,7 @@ function startAdminServer() {
           startsAt:      v.startEpoch ? new Date(v.startEpoch * 1000).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : '',
           endsAt:        new Date(v.endEpoch * 1000).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
           date:          new Date(v.endEpoch * 1000).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+          type:          v.type || 'reservation',  // reservation | event | event_shared | event_unlock
         }));
       return send(200, dashboardPage(active));
     }
@@ -782,10 +1081,20 @@ function dashboardPage(active) {
     const safeKey    = r.key.replace(/:/g, '_');
     const searchData = [r.memberName, r.email, r.phone, r.court, r.pin, r.reservationId].join(' ').toLowerCase();
 
+    const isEvent   = r.type && r.type !== 'reservation';
+    const isUnlock  = r.type === 'event_unlock';
+    const typeLabel = r.type === 'event'        ? 'Event'
+                    : r.type === 'event_shared' ? 'Event (shared PIN)'
+                    : r.type === 'event_unlock' ? 'Event (door unlock)'
+                    : 'Reservation';
+
     return `
     <div class="card" id="card-${safeKey}" data-search="${searchData}">
       <div class="card-header">
-        <div class="member-name">${r.memberName || '—'}</div>
+        <div>
+          <div class="member-name">${r.memberName || (isUnlock ? 'Door Unlock' : '—')}</div>
+          ${isEvent ? `<div class="event-badge">${typeLabel}</div>` : ''}
+        </div>
         <div class="time-badge">${r.startsAt}–${r.endsAt}</div>
       </div>
       <div class="detail-grid">
@@ -864,6 +1173,10 @@ function dashboardPage(active) {
     .time-badge  { background: #e8f0fe; color: ${b.accentColor}; border-radius: 20px;
                    padding: 3px 10px; font-size: 12px; font-weight: 600;
                    white-space: nowrap; margin-left: 8px; flex-shrink: 0; }
+    .event-badge { display: inline-block; background: #fff8e1; color: #b45309;
+                   border: 1px solid #fcd34d; border-radius: 20px;
+                   padding: 2px 8px; font-size: 11px; font-weight: 600;
+                   margin-top: 3px; }
     .detail-grid  { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
     .detail-item  { display: flex; flex-direction: column; }
     .detail-label { font-size: 10px; color: #bbb; text-transform: uppercase;
@@ -988,7 +1301,12 @@ function validateConfig() {
     process.exit(1);
   }
   if (!config.unifi.resources.length) {
-    console.warn('⚠️   UNIFI_RESOURCES is not set — visitors will have no door access assigned.');
+    console.warn('⚠️   UNIFI_RESOURCES is not set — visitors will have no door access assigned and unlock mode will have no effect.');
+  }
+  const validModes = ['pin_individual', 'pin_shared', 'unlock'];
+  if (!validModes.includes(config.events.accessMode)) {
+    console.error(`❌  Invalid EVENT_ACCESS_MODE "${config.events.accessMode}". Must be one of: ${validModes.join(', ')}`);
+    process.exit(1);
   }
 }
 
@@ -1002,6 +1320,9 @@ async function main() {
     emailTransport:       config.email.resendApiKey ? 'resend' : 'smtp',
     pinMode:              config.pinMode,
     smsEnabled:           config.twilio.enabled,
+    eventAccessMode:      config.events.accessMode,
+    eventBufferMinutes:   config.events.accessBufferMinutes,
+    eventUnlockNotify:    config.events.unlockNotify,
     resources:            config.unifi.resources,
   });
 
