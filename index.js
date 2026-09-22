@@ -517,6 +517,44 @@ async function fetchTodaysEventRegistrations() {
   return resp.data.Data || [];
 }
 
+// Resolves the ReservationId for one event session — needed so pin_individual
+// event registrants can be auto-checked-in via the PIN-unlock webhook (see
+// processUnlockWebhookEvent), since EventRegistrationReport doesn't expose a
+// ReservationId itself, only EventId/EventDateId. Queries eventlist scoped to
+// the session's own day and matches client-side on EventId + StartDateTime/
+// EndDateTime — eventlist has no EventDateId field, and its eventFilterId
+// query param does NOT filter by EventId (confirmed against production: it
+// returned zero rows for an EventId present in the same unfiltered date
+// range), so don't rely on it. status: 'All' is required so a session
+// already auto-cancelled (e.g. this club's low-participation auto-cancel,
+// which frees the court) can still be matched — a stale/cancelled
+// ReservationId just fails cleanly later at the actual check-in call.
+async function fetchEventReservationId(eventId, sessionStart, sessionEnd) {
+  const startOfDay = new Date(sessionStart.getFullYear(), sessionStart.getMonth(), sessionStart.getDate(), 0,  0,  0);
+  const endOfDay   = new Date(sessionStart.getFullYear(), sessionStart.getMonth(), sessionStart.getDate(), 23, 59, 59);
+
+  const resp = await courtreserve.get('/api/v1/eventcalendar/eventlist', {
+    params: {
+      startDate: fmtLocalDatetime(startOfDay),
+      endDate:   fmtLocalDatetime(endOfDay),
+      status:    'All',
+    },
+  });
+
+  if (!resp.data?.IsSuccessStatusCode) {
+    throw new Error(`CourtReserve eventlist API error: ${resp.data?.ErrorMessage || 'unknown'}`);
+  }
+
+  const rows  = resp.data.Data || [];
+  const match = rows.find(row =>
+    String(row.EventId) === String(eventId) &&
+    new Date(row.StartDateTime).getTime() === sessionStart.getTime() &&
+    new Date(row.EndDateTime).getTime()   === sessionEnd.getTime()
+  );
+
+  return match ? match.ReservationId : null;
+}
+
 // Looks up whether a member already holds a permanent 24/7 UniFi credential
 // (see config.permanentAccess.membershipKeyword) via CourtReserve's member
 // lookup, so processReservation/processEvents can skip issuing them a second,
@@ -911,7 +949,14 @@ async function processEvents(registrations, state) {
     log('info', `Processing event [${mode}]`, { eventKey, eventName, registrantCount: regs.length, minutesUntilStart: Math.round(minutesUntilStart) });
 
     // ── pin_individual: one visitor + PIN per registrant ──────────────────
+    // One visitor/PIN per registrant means (unlike pin_shared/unlock) the
+    // PIN-unlock webhook's visitor UUID unambiguously identifies who entered,
+    // so these entries also carry a reservationId to support auto check-in
+    // (see fetchEventReservationId / processUnlockWebhookEvent).
     if (mode === 'pin_individual') {
+      let reservationId;
+      let reservationIdFetched = false;
+
       for (const reg of regs) {
         const stateKey   = `evt:${reg.EventId}:${reg.EventDateId || 0}:${reg.OrganizationMemberId}`;
         if (state.processed[stateKey]) continue;
@@ -922,6 +967,19 @@ async function processEvents(registrations, state) {
         const phone      = reg.Phone || '';
 
         if (!email) { log('warn', 'Event registrant has no email — skipping', { stateKey }); continue; }
+
+        // Resolved once per session, on first new registrant seen this cycle —
+        // not fatal if it fails, the registrant still gets their PIN, they just
+        // won't be eligible for PIN-unlock auto check-in this session.
+        if (!reservationIdFetched) {
+          try {
+            reservationId = await fetchEventReservationId(reg.EventId, startDate, endDate);
+          } catch (err) {
+            log('warn', 'Failed to resolve event reservationId — auto check-in unavailable for this session', { eventKey, err: err.message });
+            reservationId = null;
+          }
+          reservationIdFetched = true;
+        }
 
         // Member already has a permanent 24/7 UniFi credential — see the same
         // check/comment in processReservation.
@@ -935,7 +993,7 @@ async function processEvents(registrations, state) {
             catch (err) { log('error', 'Failed to send event SMS to permanent-access member', { phone, err: err.message }); }
           }
 
-          state.processed[stateKey] = { memberId, email, pin, memberName, phone, court: eventName, startEpoch: toEpoch(startDate), endEpoch, processedAt: Math.floor(nowMs / 1000), type: 'event', permanentAccess: true };
+          state.processed[stateKey] = { memberId, reservationId, email, pin, memberName, phone, court: eventName, startEpoch: toEpoch(startDate), endEpoch, processedAt: Math.floor(nowMs / 1000), type: 'event', permanentAccess: true };
           saveState(state);
           log('info', '✅ Permanent-access event registrant — reused existing PIN, no visitor created', { stateKey, pin });
           continue;
@@ -963,9 +1021,9 @@ async function processEvents(registrations, state) {
           catch (err) { log('error', 'Failed to send event SMS', { phone, err: err.message }); }
         }
 
-        state.processed[stateKey] = { visitorId: visitor.id, memberId, email, pin, memberName, phone, court: eventName, startEpoch: toEpoch(startDate), endEpoch, processedAt: Math.floor(nowMs / 1000), type: 'event' };
+        state.processed[stateKey] = { visitorId: visitor.id, memberId, reservationId, email, pin, memberName, phone, court: eventName, startEpoch: toEpoch(startDate), endEpoch, processedAt: Math.floor(nowMs / 1000), type: 'event' };
         saveState(state);
-        log('info', '✅ Event registrant processed (individual)', { stateKey, email, pin });
+        log('info', '✅ Event registrant processed (individual)', { stateKey, email, pin, reservationId });
       }
     }
 
@@ -1112,11 +1170,13 @@ async function cleanupExpiredVisitors(state) {
 }
 
 // Handles one event from the UniFi Access unlock webhook (see the
-// /webhook/unifi-unlock route in the Admin Server section). Only plain
-// court-reservation entries carry a reservationId in v1 — event-derived
-// entries (pin_individual/pin_shared/unlock) are matched but skipped, since
-// the Event Registration Report doesn't expose a ReservationId to check in
-// against (see docs/auto-checkin.md).
+// /webhook/unifi-unlock route in the Admin Server section). Plain
+// court-reservation entries and pin_individual event entries carry a
+// reservationId (see processReservation / fetchEventReservationId) and are
+// eligible for auto check-in. pin_shared/unlock event entries are matched
+// but always skipped — those modes use one shared visitor/credential for the
+// whole event, so the webhook's visitor UUID can't identify which specific
+// registrant unlocked the door (see docs/auto-checkin.md).
 async function processUnlockWebhookEvent(event, state) {
   if (event.credential_type !== 'PIN_CODE' || event.direction !== 'entered') {
     return { skipped: true, reason: 'not_pin_entry' };
