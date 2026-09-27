@@ -502,6 +502,10 @@ async function fetchTodaysEventRegistrations() {
     params: {
       eventDateFrom: fmtLocalDatetime(startOfDay),
       eventDateTo:   fmtLocalDatetime(endOfDay),
+      // Without this, CourtReserve silently excludes guest/public-booking
+      // registrants from the response — confirmed in production, they don't
+      // come back with a blank OrganizationMemberId, they just aren't there.
+      includeGuests: true,
     },
   });
 
@@ -919,6 +923,15 @@ async function processReservation(reservation, state) {
   }
 }
 
+// Guest/public-booking registrants come back from CourtReserve with
+// OrganizationMemberId: 0 (not null) — every guest on the same event session
+// would otherwise collide on the same identifier. PublicBookingId is unique
+// per registration and confirmed present on every guest row in production, so
+// it stands in for the member ID rather than falling back to email.
+function registrantKey(reg) {
+  return reg.OrganizationMemberId || reg.PublicBookingId;
+}
+
 async function processEvents(registrations, state) {
   // Group registrations by eventId:eventDateId so we handle each event session once
   const eventMap = new Map();
@@ -958,7 +971,10 @@ async function processEvents(registrations, state) {
       let reservationIdFetched = false;
 
       for (const reg of regs) {
-        const stateKey   = `evt:${reg.EventId}:${reg.EventDateId || 0}:${reg.OrganizationMemberId}`;
+        const key = registrantKey(reg);
+        if (!key) { log('warn', 'Event registrant has no OrganizationMemberId or PublicBookingId — skipping', { eventKey, email: reg.Email }); continue; }
+
+        const stateKey   = `evt:${reg.EventId}:${reg.EventDateId || 0}:${key}`;
         if (state.processed[stateKey]) continue;
 
         const memberId   = reg.OrganizationMemberId;
@@ -1062,7 +1078,9 @@ async function processEvents(registrations, state) {
 
       for (const reg of regs) {
         if (!reg.Email) continue;
-        if (notified.has(String(reg.OrganizationMemberId))) continue;
+        const key = registrantKey(reg);
+        if (!key) { log('warn', 'Event registrant has no OrganizationMemberId or PublicBookingId — skipping', { sharedKey, email: reg.Email }); continue; }
+        if (notified.has(String(key))) continue;
 
         const memberName = `${reg.FirstName || ''} ${reg.LastName || ''}`.trim() || 'Member';
         try { await sendAccessEmail({ to: reg.Email, memberName, pin, startDate, endDate, courts: eventName, accessBufferMinutes: bufferMins, courtLabel: 'Event' }); }
@@ -1073,7 +1091,7 @@ async function processEvents(registrations, state) {
           catch (err) { log('error', 'Failed to send shared event SMS', { phone: reg.Phone, err: err.message }); }
         }
 
-        notified.add(String(reg.OrganizationMemberId));
+        notified.add(String(key));
         log('info', '✅ Shared PIN sent to registrant', { sharedKey, email: reg.Email, pin });
       }
 
@@ -1108,7 +1126,9 @@ async function processEvents(registrations, state) {
 
         for (const reg of regs) {
           if (!reg.Email) continue;
-          if (notified.has(String(reg.OrganizationMemberId))) continue;
+          const key = registrantKey(reg);
+          if (!key) { log('warn', 'Event registrant has no OrganizationMemberId or PublicBookingId — skipping', { unlockKey, email: reg.Email }); continue; }
+          if (notified.has(String(key))) continue;
 
           const memberName = `${reg.FirstName || ''} ${reg.LastName || ''}`.trim() || 'Member';
           try { await sendUnlockNotificationEmail({ to: reg.Email, memberName, eventName, startDate, endDate, accessBufferMinutes: bufferMins }); }
@@ -1119,7 +1139,7 @@ async function processEvents(registrations, state) {
             catch (err) { log('error', 'Failed to send unlock notification SMS', { phone: reg.Phone, err: err.message }); }
           }
 
-          notified.add(String(reg.OrganizationMemberId));
+          notified.add(String(key));
           log('info', '✅ Unlock notification sent to registrant', { unlockKey, email: reg.Email });
         }
 

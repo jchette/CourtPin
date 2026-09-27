@@ -230,3 +230,77 @@ integration are resolved:**
    for a member who's not actually registered for anything today, etc. Per
    this project's house rules, **no implementation without an explicit
    go-ahead** after the design is agreed on.
+
+## Guest/public-booking auto check-in — investigated and ruled out for now (2026-09-25)
+
+Prompted by a live event (Friday Dink & Donuts) where public-booking guests
+(no `OrganizationMemberId`) weren't getting PINs at all. That part turned out
+to be fixable (see below); auto check-in for these same guests did not.
+
+**Root cause of the PIN-delivery gap (fixed, shipped separately):**
+`fetchTodaysEventRegistrations()` never passed `includeGuests: true` to
+`/api/v1/eventregistrationreport/listactive` — CourtReserve silently excludes
+guest/public-booking rows without it (confirmed via a live read-only query:
+0 guest rows returned without the param, 6 returned with it, for the same
+event). Guests that *do* come back have `OrganizationMemberId: 0` (not null),
+identical across every guest on the same event — this collided every guest
+after the first onto the same `processed` state key
+(`evt:eventId:eventDateId:0`) and the same `notified` Set entry in
+`pin_shared`/`unlock`. Fixed by adding `includeGuests: true` and keying
+guest registrants on `PublicBookingId` instead (confirmed present and unique
+on every real guest row seen in production — six guests, six distinct
+`PublicBookingId` values, no fallback needed).
+
+**Investigated and ruled out: extending auto check-in to these same guests.**
+
+CourtReserve's `POST /api/v1/checkins` requires *either* `OrganizationMemberId`
+*or* `ReservationGuestId` (its own docs: "Supply exactly one of
+OrganizationMemberId (member) or ReservationGuestId (guest)"). The natural
+assumption — that `PublicBookingId` (the field guests actually get from
+`eventregistrationreport`) could stand in for `ReservationGuestId` — was
+**tested live and disproved**: submitting a real guest's `PublicBookingId`
+(228208) as `ReservationGuestId` against her event's `ReservationId` (61240166,
+which — also confirmed — equals the event session's `EventDateId`) returned a
+clean `"Registrant was not found on this reservation, or their registration is
+cancelled."` No harm done (it failed cleanly rather than silently checking in
+the wrong person), but it confirms `PublicBookingId` and `ReservationGuestId`
+are two different, unrelated ID spaces.
+
+Next, the actual `ReservationGuestId` value was recovered a different way: a
+public-booking guest's CourtReserve check-in QR code encodes it directly, in
+the format `<OrgId>_<ReservationGuestId>` (confirmed `10024` = this club's own
+org ID). Submitting that real value
+(`ReservationId: 61524990` /* = EventDateId */, `ReservationGuestId: 5796227`,
+`CheckInStatusId: 8346`) against a real test booking **succeeded**:
+
+```json
+{
+  "ReservationId": 61524990, "ReservationGuestId": 5796227,
+  "OrganizationMemberId": null, "IsGuest": true, "IsCheckedIn": true,
+  "CheckInStatusId": 8346, "CheckInStatusName": "Checked-In",
+  "EventId": 2289662, "EventName": "TEST"
+}
+```
+
+So the check-in mechanism for guests is real and works — the blocker is
+purely that CourtPin has no way to *obtain* `ReservationGuestId`
+programmatically. It was searched for exhaustively and never found: a raw
+substring search for both `5796227` and `10024` across the full JSON payload
+of `eventregistrationreport/listactive`, `reservationreport/listactive`
+(with `includePinCodes: true`), and `reservationreport/whoisheretoday`, all
+over a 3-day window including the test booking's own event — zero matches
+anywhere. `whoisheretoday` in particular excludes guests entirely (no
+`includeGuests`-equivalent param), same as every other report endpoint
+except `eventregistrationreport`. The QR code is, as far as this
+investigation could determine, the *only* place `ReservationGuestId` is ever
+exposed — and CourtPin's poll-based architecture never sees it (there's no
+webhook from CourtReserve on new bookings, and even if there were, CourtPin
+isn't the system generating or displaying that QR code to the guest).
+
+**Conclusion: not implementable against the currently-documented API
+surface.** Ruled out, not abandoned — if this matters enough to revisit, the
+next step is asking CourtReserve support directly whether any endpoint
+returns `ReservationGuestId` for a guest/public-booking registration (framed
+exactly that way, now that the exact missing piece is known), not further
+guessing from CourtPin's side. Documented in `docs/auto-checkin.md`'s Known
+limitations for the user-facing version of this.
