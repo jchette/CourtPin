@@ -74,7 +74,7 @@ Other possible causes:
 CourtReserve API error: {"ErrorMessage":"Unauthorized",...}
 ```
 
-**Fix:** Check `CR_ORG_ID` and `CR_API_KEY`. The org ID is the number in your CourtReserve admin URL after `/organization/`. The API key is found in Admin → Settings → API Access.
+**Fix:** Check `CR_ORG_ID` and `CR_API_KEY`, both found in Admin → Settings → API Access. `CR_ORG_ID` must be the API key's **username** as shown there — not necessarily your org ID. If you deleted and reissued the key, it has a new username, and leaving `CR_ORG_ID` at the old value makes every request fail with `Request failed with status code 401` (confirmed in production after a key rotation).
 
 ---
 

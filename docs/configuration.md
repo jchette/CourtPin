@@ -12,7 +12,7 @@ Paste this into Railway → Variables → Raw Editor and fill in every value:
 
 ```
 CR_BASE_URL=https://api.courtreserve.com
-CR_ORG_ID=your_org_id_here
+CR_ORG_ID=your_api_key_username_here
 CR_API_KEY=your_api_key_here
 UNIFI_HOST=https://YOUR_PUBLIC_IP_OR_HOSTNAME:12445
 UNIFI_API_TOKEN=your_unifi_api_token_here
@@ -66,8 +66,18 @@ CourtReserve uses **HTTP Basic Authentication** — `CR_ORG_ID` is sent as the u
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `CR_BASE_URL` | No | `https://api.courtreserve.com` | CourtReserve API base URL. Only change if given a custom URL by CourtReserve support. |
-| `CR_ORG_ID` | Yes | — | Your organisation ID. Found in the CourtReserve admin portal URL after `/organization/`. |
-| `CR_API_KEY` | Yes | — | Your API key. CourtReserve Admin → Settings → API Access. Requires **ReservationReport → Read** permission. |
+| `CR_ORG_ID` | Yes | — | The **username** CourtReserve shows for your API key (Admin → Settings → API Access). Despite the variable name, this is not necessarily your organisation ID — a deleted and reissued key gets a new username, and leaving the old value here makes every request fail with `401`. |
+| `CR_API_KEY` | Yes | — | Your API key. CourtReserve Admin → Settings → API Access. See the required roles below. |
+
+**Required API key roles** — scope the key to exactly these rather than using a full-access key:
+
+| Role | Permission | Used for |
+|---|---|---|
+| `ReservationReport` | Read | Today's court reservations; admin portal PIN lookup |
+| `EventRegistrationReport` | Read | Today's event registrations (including guests) |
+| `EventCalendar` | Read | Resolving an event session's reservation ID for auto check-in (`pin_individual` only) |
+| `Member` | Read | Permanent-access membership check (`PERMANENT_ACCESS_MEMBERSHIP_KEYWORD` only) |
+| `Check-In` | Write | Auto check-in (`AUTO_CHECKIN_ENABLED` only) |
 
 ---
 
@@ -193,7 +203,7 @@ Find hex color codes at [htmlcolorcodes.com](https://htmlcolorcodes.com).
 
 ## Auto Check-In (optional)
 
-When enabled, entering a PIN at the door also submits a CourtReserve check-in for that member automatically — no separate kiosk touch needed. Reuses `CR_ORG_ID`/`CR_API_KEY` above; no new CourtReserve credentials required, but the API key needs the **Check-In** role (Write permission) enabled. v1 scope is plain court reservations only, not event registrations. Full setup (including the UniFi Alarm Manager webhook configuration) is in [auto-checkin.md](auto-checkin.md).
+When enabled, entering a PIN at the door also submits a CourtReserve check-in for that member automatically — no separate kiosk touch needed. Reuses `CR_ORG_ID`/`CR_API_KEY` above; no new CourtReserve credentials required, but the API key needs the **Check-In** role (Write permission) enabled. Scope is plain court reservations and `EVENT_ACCESS_MODE=pin_individual` event registrations (not `pin_shared`/`unlock`, and not guest/public-booking registrants). Full setup (including the UniFi Alarm Manager webhook configuration) is in [auto-checkin.md](auto-checkin.md).
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
